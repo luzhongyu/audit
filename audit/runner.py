@@ -1,15 +1,16 @@
-"""Run one agent: open a ClaudeSDKClient session, send a JSON input,
+"""Run one agent: open an OpenCode Server session, send a JSON input,
 parse + schema-validate the final JSON output, and persist a JSONL
 artifact of every message exchanged.
 
-Always uses ClaudeSDKClient (not query()) so that a schema-validation
-failure can be followed up with a repair turn inside the same session.
+Uses the OpenCode Server HTTP API (opencode serve) instead of the
+Claude Code Agent SDK.  Each call creates a short-lived session so
+that a schema-validation failure can be followed up with a repair turn
+inside the same conversation context.
 
-API-error handling: the Claude CLI surfaces 529 Overloaded and
-subscription-quota-exhausted errors as `ResultMessage(is_error=True)` with
-the error text in place of a real assistant response. We detect this
-BEFORE schema validation, classify the error, and either retry with
-exponential backoff (transient) or raise QuotaExhaustedError (terminal).
+API-error handling: the OpenCode server surfaces errors as HTTP
+error codes or `is_error=true` in the response body.  We classify the
+error and either retry with exponential backoff (transient) or raise
+QuotaExhaustedError (terminal).
 """
 
 from __future__ import annotations
@@ -23,18 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-)
-
 from audit.json_utils import extract_json, validate_schema
+from audit.opencode_client import OpenCodeClient
 
 log = logging.getLogger(__name__)
 
@@ -61,31 +52,43 @@ class AgentRunError(RuntimeError):
 
 
 class TransientAgentError(RuntimeError):
-    """API returned a transient error (529 Overloaded, generic 5xx).
+    """API returned a transient error (server overloaded, network issue).
     The agent call should be retried with backoff."""
 
 
 class QuotaExhaustedError(RuntimeError):
-    """The Claude subscription has run out of quota. Don't retry — abort
-    the pipeline and let the user wait for the reset window."""
+    """The LLM provider has returned a quota / rate-limit error.
+    Don't retry — abort the pipeline and let the user wait."""
 
 
 _QUOTA_MARKERS = (
-    "out of extra usage",
+    "quota",
+    "rate limit exceeded",
+    "rate_limit",
     "usage limit reached",
-    "your plan has no remaining",
+    "out of credits",
+    "insufficient_quota",
+    "429",
 )
 
 _TRANSIENT_MARKERS = (
-    "api error: 529",
     "overloaded",
+    "service unavailable",
+    "temporarily unavailable",
     "api error: 503",
     "api error: 502",
     "api error: 504",
     "api error: 500",
-    "rate_limit",
-    "temporarily unavailable",
-    "service unavailable",
+    "api error: 529",
+    "socket connection",
+    "connection closed",
+    "connection reset",
+    "unexpectedly closed",
+    "timeout",
+    "timed out",
+    "internal server error",
+    "bad gateway",
+    "no user message found",    # OpenCode server race condition
 )
 
 
@@ -117,14 +120,17 @@ async def run_agent(
     repair_attempts: int = 1,
     transient_retries: int = 3,
     transient_base_delay: float = 30.0,
+    opencode_client: OpenCodeClient | None = None,
 ) -> AgentResult:
     """Run one agent, retrying transient API errors with exponential backoff.
 
-    Raises `QuotaExhaustedError` if the subscription is out of quota
-    (caller should abort the run). Raises `TransientAgentError` if all
-    backoff retries are exhausted. Raises `AgentRunError` if the model
-    produced parseable output that doesn't match the schema even after
-    repair turns.
+    Uses the OpenCode Server API instead of the Claude Code Agent SDK.
+
+    Raises ``QuotaExhaustedError`` if the LLM provider returns a
+    quota/rate-limit error (caller should abort the run).
+    Raises ``TransientAgentError`` if all backoff retries are exhausted.
+    Raises ``AgentRunError`` if the model produced parseable output that
+    doesn't match the schema even after repair turns.
     """
     last_exc: RuntimeError | None = None
     for attempt in range(transient_retries + 1):
@@ -143,6 +149,7 @@ async def run_agent(
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
+                opencode_client=opencode_client,
             )
         except QuotaExhaustedError:
             raise
@@ -176,18 +183,25 @@ async def _run_agent_once(
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
+    opencode_client: OpenCodeClient | None = None,
 ) -> AgentResult:
-    """Single attempt. Raises TransientAgentError / QuotaExhaustedError
-    before schema validation if the API returned is_error=True."""
+    """Single attempt via the OpenCode Server HTTP API.
+
+    Raises TransientAgentError / QuotaExhaustedError before schema
+    validation if the API returned an error.
+    """
+    client = opencode_client or OpenCodeClient(directory=str(cwd))
+
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{artifact_name}.jsonl"
     cwd.mkdir(parents=True, exist_ok=True)
 
+    log.info(
+        "[%s/%s] starting agent: model=%s max_turns=%d tools=%d",
+        stage, artifact_name, model, max_turns, len(allowed_tools),
+    )
+
     system_prompt = prompt_file.read_text()
-    # Append the literal schema body so the model never has to guess
-    # field names — this drastically reduces schema-validation failures
-    # on the first attempt and frees up the repair budget for real
-    # ambiguities.
     schema_text = schema_file.read_text()
     system_prompt += (
         "\n\n# Output schema\n\n"
@@ -195,15 +209,6 @@ async def _run_agent_once(
         "Pay attention to nested objects, required fields, and "
         "`additionalProperties: false`.\n\n"
         f"```json\n{schema_text}\n```\n"
-    )
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        allowed_tools=allowed_tools,
-        model=model,
-        max_turns=max_turns,
-        cwd=str(cwd),
-        add_dirs=[str(p) for p in (add_dirs or [])],
-        permission_mode=permission_mode,
     )
 
     initial_prompt = json.dumps(user_input, ensure_ascii=False)
@@ -213,39 +218,78 @@ async def _run_agent_once(
     repair_used = False
 
     with artifact_path.open("w") as art:
-        _write_artifact(art, {"kind": "meta", "stage": stage, "model": model, "started_at": time.time()})
+        _write_artifact(art, {
+            "kind": "meta", "stage": stage, "model": model,
+            "started_at": time.time(),
+        })
         _write_artifact(art, {"kind": "user", "text": initial_prompt[:50000]})
 
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(initial_prompt)
-            last_text, last_result_msg = await _drain(client, art)
+        session = await client.agent_session(
+            model=model,
+            tools=allowed_tools,
+            title=f"{stage}/{artifact_name}",
+            directory=str(cwd),
+        )
+        async with session:
+            # --- initial prompt ---
+            t0 = time.time()
+            msg = await session.send(initial_prompt, system=system_prompt)
+            elapsed = (time.time() - t0) * 1000
+            _write_artifact(art, _serialize_msg(msg))
+            last_text = msg.text
+            last_result_msg = _msg_to_dict(msg)
+            usage = msg.usage or {}
+            log.info(
+                "[%s/%s] agent responded in %.0fms: model=%s turns=%d "
+                "input=%d output=%d cost=$%.4f is_error=%s",
+                stage, artifact_name, elapsed, msg.model, msg.num_turns or 0,
+                usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                msg.total_cost_usd or 0.0, msg.is_error,
+            )
 
             # Before schema validation: was this a real model response, or
-            # did the CLI surface an API error as the assistant text?
-            if last_result_msg.get("is_error"):
+            # did the server surface an API error?
+            if msg.is_error:
                 label, exc_cls = _classify_api_error(last_text)
-                _write_artifact(art, {"kind": "api_error", "classification": label,
-                                      "text": last_text[:1000]})
+                _write_artifact(art, {
+                    "kind": "api_error", "classification": label,
+                    "text": last_text[:1000],
+                })
                 raise exc_cls(
                     f"[{stage}/{artifact_name}] {label}: "
                     f"{(last_text or '').strip()[:300]}"
                 )
 
+            # --- repair loop ---
             attempts = 0
             errors = _validate(last_text, schema_file)
+            if errors:
+                log.info(
+                    "[%s/%s] schema validation failed, attempting repair (max %d): %s",
+                    stage, artifact_name, repair_attempts, errors[:3],
+                )
             while errors and attempts < repair_attempts:
                 attempts += 1
                 repair_used = True
                 repair_prompt = _build_repair_prompt(last_text, errors, schema_file)
-                _write_artifact(art, {"kind": "repair_request", "text": repair_prompt[:50000]})
-                await client.query(repair_prompt)
-                last_text, last_result_msg = await _drain(client, art)
-                # An API error on the repair turn is also retry-worthy.
-                if last_result_msg.get("is_error"):
+                log.info(
+                    "[%s/%s] repair turn %d/%d …",
+                    stage, artifact_name, attempts, repair_attempts,
+                )
+                _write_artifact(art, {
+                    "kind": "repair_request", "text": repair_prompt[:50000],
+                })
+                msg = await session.send(repair_prompt)
+                _write_artifact(art, _serialize_msg(msg))
+                last_text = msg.text
+                last_result_msg = _msg_to_dict(msg)
+
+                if msg.is_error:
                     label, exc_cls = _classify_api_error(last_text)
-                    _write_artifact(art, {"kind": "api_error_on_repair",
-                                          "classification": label,
-                                          "text": last_text[:1000]})
+                    _write_artifact(art, {
+                        "kind": "api_error_on_repair", "classification": label,
+                        "text": last_text[:1000],
+                    })
                     raise exc_cls(
                         f"[{stage}/{artifact_name}] {label} on repair turn: "
                         f"{(last_text or '').strip()[:300]}"
@@ -254,9 +298,19 @@ async def _run_agent_once(
 
             if errors:
                 _write_artifact(art, {"kind": "schema_errors", "errors": errors})
+                log.warning(
+                    "[%s/%s] schema still invalid after %d repair turns: %s",
+                    stage, artifact_name, repair_attempts, errors[:3],
+                )
                 raise AgentRunError(
                     f"[{stage}/{artifact_name}] schema validation failed after "
                     f"{repair_attempts} repair attempts: {errors[:5]}"
+                )
+
+            if repair_used:
+                log.info(
+                    "[%s/%s] schema validated after %d repair turn(s)",
+                    stage, artifact_name, attempts,
                 )
 
         payload = extract_json(last_text)
@@ -277,31 +331,6 @@ async def _run_agent_once(
         repair_used=repair_used,
         raw_result_message=last_result_msg,
     )
-
-
-async def _drain(client: ClaudeSDKClient, art) -> tuple[str, dict[str, Any]]:
-    """Consume the response stream, write each message to the JSONL
-    artifact, and return (concatenated assistant text from last
-    assistant message, result_message_dict)."""
-    text_chunks: list[str] = []
-    result_msg: dict[str, Any] = {}
-    last_assistant_text: list[str] = []
-
-    async for msg in client.receive_response():
-        _write_artifact(art, _serialize_message(msg))
-        if isinstance(msg, AssistantMessage):
-            last_assistant_text = []
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    last_assistant_text.append(block.text)
-            text_chunks.append("".join(last_assistant_text))
-        elif isinstance(msg, ResultMessage):
-            result_msg = _result_to_dict(msg)
-
-    final_text = "".join(last_assistant_text) if last_assistant_text else (
-        text_chunks[-1] if text_chunks else ""
-    )
-    return final_text, result_msg
 
 
 def _validate(text: str, schema_file: Path) -> list[str]:
@@ -336,51 +365,26 @@ def _json_fallback(o: Any) -> Any:
     return repr(o)
 
 
-def _serialize_message(msg: Any) -> dict[str, Any]:
-    if isinstance(msg, AssistantMessage):
-        return {
-            "kind": "assistant",
-            "model": msg.model,
-            "usage": msg.usage,
-            "content": [_serialize_block(b) for b in msg.content],
-        }
-    if isinstance(msg, ResultMessage):
-        return {"kind": "result", **_result_to_dict(msg)}
-    if dataclasses.is_dataclass(msg):
-        return {"kind": type(msg).__name__, **dataclasses.asdict(msg)}
-    return {"kind": type(msg).__name__, "repr": repr(msg)}
-
-
-def _serialize_block(b: Any) -> dict[str, Any]:
-    if isinstance(b, TextBlock):
-        return {"type": "text", "text": b.text}
-    if isinstance(b, ThinkingBlock):
-        return {"type": "thinking", "thinking": b.thinking}
-    if isinstance(b, ToolUseBlock):
-        return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
-    if isinstance(b, ToolResultBlock):
-        return {
-            "type": "tool_result",
-            "tool_use_id": b.tool_use_id,
-            "content": b.content,
-            "is_error": b.is_error,
-        }
-    if dataclasses.is_dataclass(b):
-        return dataclasses.asdict(b)
-    return {"type": type(b).__name__, "repr": repr(b)}
-
-
-def _result_to_dict(msg: ResultMessage) -> dict[str, Any]:
+def _serialize_msg(msg: Any) -> dict[str, Any]:
+    """Serialize an OpenCodeMessage for JSONL artifact logging."""
     return {
-        "subtype": msg.subtype,
+        "kind": "assistant",
+        "model": msg.model,
+        "usage": msg.usage or {},
+        "text": msg.text[:100000],
+        "is_error": msg.is_error,
+        "raw": msg.raw if msg.raw else {},
+    }
+
+
+def _msg_to_dict(msg: Any) -> dict[str, Any]:
+    """Extract metadata dict from an OpenCodeMessage (like old _result_to_dict)."""
+    return {
         "is_error": msg.is_error,
         "duration_ms": msg.duration_ms,
-        "duration_api_ms": msg.duration_api_ms,
         "num_turns": msg.num_turns,
         "session_id": msg.session_id,
         "stop_reason": msg.stop_reason,
         "total_cost_usd": msg.total_cost_usd,
-        "usage": msg.usage,
-        "result": msg.result,
-        "model_usage": msg.model_usage,
+        "usage": msg.usage or {},
     }

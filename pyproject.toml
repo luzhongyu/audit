@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "audit"
 version = "0.1.0"
-description = "Cloudflare-style 8-stage vulnerability discovery audit agent driven by Claude Code subscription auth"
+description = "8-stage vulnerability discovery audit agent powered by the OpenCode server API"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "claude-agent-sdk>=0.0.20",
     "click>=8.1",
+    "httpx>=0.28",
     "pydantic>=2.6",
     "jsonschema>=4.21",
     "pyyaml>=6.0",

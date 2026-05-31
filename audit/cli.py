@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -16,14 +15,6 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from audit.auth import AuthError, configure_auth
-
-
-def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
-    """A user may opt into api_key mode via --allow-api-key OR via
-    AUDIT_ALLOW_API_KEY=1 in the env. Either is sufficient."""
-    if flag:
-        return True
-    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip() not in ("", "0", "false", "False")
 from audit.config import load_config
 from audit.orchestrator import CostExceeded, run_pipeline
 from audit.state import StateDB
@@ -50,47 +41,38 @@ def _setup_logging(verbose: bool) -> None:
 @click.option("-v", "--verbose", is_flag=True, help="DEBUG logging.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
-    """audit — Cloudflare-style 8-stage vulnerability discovery agent."""
+    """audit — 8-stage vulnerability discovery agent powered by OpenCode."""
     ctx.ensure_object(dict)
     _setup_logging(verbose)
 
 
 @main.command("auth-check")
-@click.option("--allow-api-key", is_flag=True, default=False,
-              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
-                   "(also via AUDIT_ALLOW_API_KEY=1).")
-def auth_check(allow_api_key: bool) -> None:
-    """Verify Claude Code auth is configured correctly."""
-    allow = _allow_api_key_from_env_or_flag(allow_api_key)
+def auth_check() -> None:
+    """Verify OpenCode CLI is available and server is reachable."""
     try:
-        status = configure_auth(allow_api_key=allow)
+        status = configure_auth()
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
-    if status.auth_mode == "oauth_token":
-        console.print("[green]OK[/green] using CLAUDE_CODE_OAUTH_TOKEN")
-    elif status.auth_mode == "api_key":
+
+    if status.opencode_cli_path:
         console.print(
-            "[green]OK[/green] using ANTHROPIC_API_KEY (metered Anthropic API billing)"
+            f"[green]opencode CLI:[/green] {status.opencode_cli_path} "
+            f"({status.opencode_cli_version or 'unknown'})"
         )
-    elif status.auth_mode == "keychain_login":
+    if status.opencode_config_dir:
+        console.print(f"[green]config dir:[/green] {status.opencode_config_dir}")
+
+    if status.server_reachable:
         console.print(
-            f"[green]OK[/green] using stored login from {status.credentials_file}"
+            f"[green]server:[/green] reachable "
+            f"({status.server_version or 'unknown'})"
         )
-    elif status.auth_mode == "gateway":
+    else:
         console.print(
-            f"[green]OK[/green] using LLM gateway at {status.gateway_base_url} "
-            "(ANTHROPIC_AUTH_TOKEN)"
+            "[yellow]server:[/yellow] not running — start it with "
+            "[bold]opencode serve[/bold] (or the runner will auto-start it)"
         )
-        if status.gateway_model:
-            console.print(f"          ANTHROPIC_MODEL={status.gateway_model}")
-    if status.api_key_scrubbed:
-        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_API_KEY removed from env "
-                      "(it would have outranked the active auth mode)")
-    if status.auth_token_scrubbed:
-        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_AUTH_TOKEN removed from env "
-                      "(no gateway base URL set — leaving it would outrank subscription)")
-    console.print(f"claude CLI: {status.claude_cli_path} ({status.claude_cli_version})")
 
 
 @main.command("run")
@@ -118,19 +100,14 @@ def auth_check(allow_api_key: bool) -> None:
                    "rules / exclusions; passed verbatim to every stage.")
 @click.option("--config", "config_path", default=None, type=click.Path(),
               help="Override config/stages.yaml.")
-@click.option("--allow-api-key", is_flag=True, default=False,
-              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
-                   "(also via AUDIT_ALLOW_API_KEY=1).")
 def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         max_concurrency: int | None, max_recon_tasks: int | None,
         target_url: str | None, target_creds: tuple[str, ...],
         scope_notes_path: str | None,
-        config_path: str | None,
-        allow_api_key: bool) -> None:
+        config_path: str | None) -> None:
     """Run the full 8-stage pipeline against a target repo."""
-    allow = _allow_api_key_from_env_or_flag(allow_api_key)
     try:
-        configure_auth(allow_api_key=allow)
+        configure_auth()
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)

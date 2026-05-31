@@ -1,6 +1,5 @@
 # Per-stage configuration. Model diversity between Hunt and Validate is
-# load-bearing: it implements the blog's "deliberate disagreement" rule.
-# Trace runs on Opus because the paper calls it "the stage that matters most."
+# load-bearing: it implements the "deliberate disagreement" rule.
 
 defaults:
   max_turns: 25
@@ -9,39 +8,39 @@ defaults:
 
 stages:
   recon:
-    model: claude-opus-4-7
+    model: deepseek-v4-flash
     concurrency: 1
-    tools: [Read, Grep, Glob, Bash]
-    max_turns: 60                # recon can be long
+    tools: [read, grep, glob, bash]
+    max_turns: 10                # recon can be long
     repair_attempts: 2           # critical one-shot; spend a second repair turn if needed
   hunt:
-    model: claude-sonnet-4-6
+    model: deepseek-v4-flash
     concurrency: 50
-    tools: [Read, Grep, Glob, Bash]
+    tools: [read, grep, glob, bash]
   validate:
-    model: claude-opus-4-7        # different from hunt — deliberate disagreement
+    model: deepseek-v4-pro        # different from hunt — deliberate disagreement
     concurrency: 10
-    tools: [Read, Grep, Glob]     # no Bash: pure analysis
+    tools: [read, grep, glob]     # no Bash: pure analysis
   gapfill:
-    model: claude-sonnet-4-6
+    model: deepseek-v4-pro
     concurrency: 1
-    tools: [Read, Grep, Glob]
+    tools: [read, grep, glob]
   dedupe:
-    model: claude-sonnet-4-6
+    model: deepseek-v4-pro
     concurrency: 1
-    tools: [Read]
+    tools: [read]
   trace:
-    model: claude-opus-4-7        # most critical stage
+    model: deepseek-v4-pro        # most critical stage
     concurrency: 10
-    tools: [Read, Grep, Glob, Bash]
+    tools: [read, grep, glob, bash]
   feedback:
-    model: claude-sonnet-4-6
+    model: deepseek-v4-flash
     concurrency: 1
-    tools: [Read, Grep, Glob]
+    tools: [read, grep, glob]
   report:
-    model: claude-sonnet-4-6
+    model: deepseek-v4-flash
     concurrency: 1
-    tools: [Read]
+    tools: [read]
 
 # Bounded loops to prevent runaway cost
 loops:

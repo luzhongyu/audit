@@ -12,10 +12,12 @@ from audit.runner import (
 
 
 @pytest.mark.parametrize("text", [
-    "You're out of extra usage · resets 2am (Europe/Rome)",
+    "Insufficient quota · resets 2am (Europe/Rome)",
     "Usage limit reached for the day.",
-    "Your plan has no remaining quota.",
-    "YOU'RE OUT OF EXTRA USAGE.",
+    "quota exceeded for the current billing period",
+    "429 Too Many Requests",
+    "rate limit exceeded, please slow down",
+    "rate_limit hit",
 ])
 def test_quota_classified(text: str) -> None:
     label, exc = _classify_api_error(text)
@@ -28,9 +30,8 @@ def test_quota_classified(text: str) -> None:
     "Server overloaded — please try again",
     "API Error: 503",
     "API Error: 502 Bad Gateway",
-    "API Error: 500 Internal Server Error",
-    "rate_limit hit",
-    "Service temporarily unavailable",
+        "API Error: 500 Internal Server Error",
+        "Service temporarily unavailable",
 ])
 def test_transient_classified(text: str) -> None:
     label, exc = _classify_api_error(text)

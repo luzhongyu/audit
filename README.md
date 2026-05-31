@@ -1,10 +1,9 @@
 # audit
 
-An 8-stage vulnerability-discovery agent, driven by your **Claude Pro / Max
-subscription** through the official Claude Code Agent SDK. Many narrow agents,
-deliberate disagreement, and an explicit reachability gate.
+An 8-stage vulnerability-discovery agent, powered by the **OpenCode Server API**.
+Many narrow agents, deliberate disagreement, and an explicit reachability gate.
 
-MIT-licensed. No API key needed if you already use `claude login`.
+MIT-licensed. No API key needed if you already use `opencode`.
 
 ## Origin
 
@@ -35,16 +34,16 @@ store, and orchestrator.
 
 <sub>Diagram from Cloudflare's [Project Glasswing](https://blog.cloudflare.com/cyber-frontier-models/) post, reproduced here for reference.</sub>
 
-| # | Stage    | Default model | Purpose |
-|---|----------|---------------|---------|
-| 1 | Recon    | Opus 4.7  | Map the repo, emit narrowly-scoped Hunt tasks |
-| 2 | Hunt     | Sonnet 4.6 | One attack class per agent; compile/run PoCs |
-| 3 | Validate | Opus 4.7  | Adversarial re-read; tries to **disprove** (different model from Hunt) |
-| 4 | Gapfill  | Sonnet 4.6 | Re-queue under-covered areas |
-| 5 | Dedupe   | Sonnet 4.6 | Cluster findings by root cause |
-| 6 | Trace    | Opus 4.7  | Prove attacker-controlled input reaches the sink |
-| 7 | Feedback | Sonnet 4.6 | Turn reachable traces into new Hunt tasks |
-| 8 | Report   | Sonnet 4.6 | Schema-validated structured report |
+| # | Stage    | Purpose |
+|---|----------|---------|
+| 1 | Recon    | Map the repo, emit narrowly-scoped Hunt tasks |
+| 2 | Hunt     | One attack class per agent; compile/run PoCs |
+| 3 | Validate | Adversarial re-read; tries to **disprove** (different model from Hunt) |
+| 4 | Gapfill  | Re-queue under-covered areas |
+| 5 | Dedupe   | Cluster findings by root cause |
+| 6 | Trace    | Prove attacker-controlled input reaches the sink |
+| 7 | Feedback | Turn reachable traces into new Hunt tasks |
+| 8 | Report   | Schema-validated structured report |
 
 Each stage is one markdown prompt in `prompts/` + one JSON Schema in
 `schemas/`. The orchestrator passes the schema into the system prompt so
@@ -57,11 +56,8 @@ every output is shape-stable on the first try.
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 
-# 2. Auth (pick one)
-#    (a) Already logged in via claude login? You're done.
-#    (b) Or generate a 1-year OAuth token for CI / non-interactive use:
-claude setup-token
-echo "CLAUDE_CODE_OAUTH_TOKEN=<paste>" > .env
+# 2. Install OpenCode (if not already installed)
+curl -fsSL https://opencode.ai/install | bash
 
 # 3. Verify
 audit auth-check
@@ -72,73 +68,86 @@ audit status --run-id my-run
 audit report --run-id my-run --format md > report.md
 ```
 
-By default the agent uses **subscription billing** via your Claude.ai
-login — it does **not** call the metered Anthropic API. The on-disk auth
-module scrubs `ANTHROPIC_API_KEY` from the environment so it can't
-silently route around the OAuth flow.
+The runner auto-starts `opencode serve` in the background.
+You can also start it manually: `opencode serve`.
 
-## Using a different model / provider
+OpenCode handles its own authentication — configure your provider via
+`opencode.json` or the `/connect` TUI command.
 
-The auth module picks one of three modes, in this order:
+## OpenCode integration
 
-1. **LLM gateway** (OpenRouter, custom proxy, etc.) — when
-   `ANTHROPIC_BASE_URL` points away from `anthropic.com` AND
-   `ANTHROPIC_AUTH_TOKEN` is set. The gateway env is left intact;
-   only `ANTHROPIC_API_KEY` is scrubbed (it would otherwise outrank the
-   gateway token).
-2. **Subscription OAuth (headless)** — `CLAUDE_CODE_OAUTH_TOKEN` from
-   `claude setup-token`. Best for CI.
-3. **Subscription OAuth (interactive)** — `~/.claude/.credentials.json`
-   from `claude login`. Best for local dev.
+This project originally used the **Claude Code Agent SDK** (`claude-agent-sdk`)
+to drive agent calls. It has been rewritten to use the
+**[OpenCode Server HTTP API](https://opencode.ai/docs/server)** instead.
 
-### OpenRouter
+### Why the switch
 
-OpenRouter exposes Claude-compatible Anthropic-API endpoints behind its
-own credit system; that lets you spend OpenRouter credits instead of an
-Anthropic subscription, and gives you access to Sonnet/Opus *and* other
-models through the same SDK path. See [OpenRouter's Agent SDK guide](https://openrouter.ai/docs/guides/community/anthropic-agent-sdk).
+| Concern | Claude Code Agent SDK | OpenCode Server API |
+| --- | --- | --- |
+| Provider lock-in | Anthropic API key required | Any provider OpenCode supports |
+| Open-source | SDK is proprietary | OpenCode is MIT-licensed |
+| Cost | Anthropic pricing only | Use DeepSeek, open-weight models, etc. |
+| Permission handling | Interactive prompts block CI | `external_directory: allow` via config |
+| Session model | One-shot, stateless | Long-lived sessions + repair turns |
 
-```bash
-export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
-export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
-export ANTHROPIC_API_KEY=""           # must be explicitly empty / unset
-# optional: pick a non-Anthropic model
-export ANTHROPIC_MODEL="anthropic/claude-sonnet-4-6"
-# or e.g.: ANTHROPIC_MODEL="openai/gpt-5"
-#         ANTHROPIC_MODEL="google/gemini-2.5-pro"
-#         ANTHROPIC_MODEL="qwen/qwen3-coder-480b"
+### How it works
 
-audit auth-check                       # confirms "using LLM gateway at https://openrouter.ai/api"
-audit run --repo /path/to/target --run-id orun --max-cost-usd 30
+`audit/opencode_client.py` is a thin async HTTP client that talks to
+`opencode serve` (default `http://127.0.0.1:4096`). Every agent call follows
+this lifecycle:
+
+1. **Ensure server is running** — `ensure_running()` checks `/global/health`;
+    if the server is down, it auto-spawns `opencode serve` with
+    `OPENCODE_CONFIG_CONTENT='{"permission":{"external_directory":"allow"}}'`
+    so agents can read target repo files without interactive prompts.
+
+2. **Create a short-lived session** — `POST /session?directory=/path/to/repo`
+    with an `x-opencode-directory` header scopes the session to the target
+    codebase. Each agent call gets its own session.
+
+3. **Send the prompt** — `POST /session/{id}/message` with `parts`
+    (user message), `system` (stage prompt + output schema), `model`, and
+    `tools`. The server runs the tool-use loop automatically and returns the
+    final assistant response.
+
+4. **Schema-validate the output** — if the JSON doesn't match the stage's
+    schema, a repair turn is sent on the same session, asking the model to
+    fix only the schema errors. Up to `repair_attempts` retries.
+
+5. **Delete the session** — `DELETE /session/{id}` cleans up.
+
+6. **Retry on transient errors** — HTTP 5xx, server overload, quota
+    exhaustion, and OpenCode internal race conditions are classified and
+    retried with exponential backoff (configurable per stage).
+
+The `x-opencode-directory` header on the HTTP client sets the working
+directory for all requests. Session-scoped directory is passed as a query
+param on `POST /session` so each agent sees the correct repo.
+
+### Server lifecycle
+
+The runner reuses an existing `opencode serve` process if one is already
+running on the configured port. It only starts a new server when the health
+check fails. Concurrent tasks are gated by an `asyncio.Lock` to prevent
+racing to start the server.
+
+## Configuring models
+
+Per-stage model overrides are in `config/stages.yaml`:
+
+```yaml
+stages:
+  recon:
+    model: deepseek-v4-flash
+    concurrency: 1
+    tools: [Read, Grep, Glob, Bash]
+  validate:
+    model: deepseek-v4-pro        # different from Hunt — deliberate disagreement
+    tools: [Read, Grep, Glob]
 ```
 
-Caveats:
-- Per-stage model overrides in `config/stages.yaml` are model **names**
-  (e.g. `claude-opus-4-7`); OpenRouter accepts slash-prefixed forms like
-  `anthropic/claude-opus-4-7`. Edit the YAML if you want different
-  providers per stage. Otherwise `ANTHROPIC_MODEL` forces every stage
-  onto one model.
-- Non-Claude models may not produce schema-compliant JSON as reliably.
-  The runner's schema-validation + repair turn still applies; quality
-  varies by model.
-- Tool-use semantics (Read/Grep/Glob/Bash) are part of the Claude Code
-  CLI, not the model — they work as long as the gateway speaks the
-  Anthropic Messages API.
-
-### Other gateways / cloud providers
-
-Same recipe — anything that exposes the Anthropic Messages API at a URL
-+ a bearer token works:
-
-```bash
-export ANTHROPIC_BASE_URL="https://your-proxy.example.com"
-export ANTHROPIC_AUTH_TOKEN="$YOUR_TOKEN"
-unset ANTHROPIC_API_KEY
-```
-
-For Amazon Bedrock / Google Vertex / Microsoft Foundry, Claude Code has
-first-class env-var flags (`CLAUDE_CODE_USE_BEDROCK=1` etc.) that
-outrank everything else. See the [Claude Code auth docs](https://code.claude.com/docs/en/authentication).
+Models are resolved by the OpenCode server. Set your default model in
+`opencode.json` or via environment variables (e.g. `OPENCODE_DEFAULT_MODEL`).
 
 ## Cost containment
 
@@ -147,7 +156,7 @@ validate. At default concurrency this gets expensive. Flags to keep it sane:
 
 ```bash
 audit run --repo /path/to/target \
-  --max-concurrency 1 \           # one claude subprocess at a time
+  --max-concurrency 1 \           # one agent call at a time
   --max-recon-tasks 15 \          # cap initial Hunt fanout
   --max-cost-usd 30               # abort cleanly if exceeded
 ```
@@ -157,11 +166,7 @@ Hunt cooperatively aborts rather than running 30 more tasks past the cap.
 
 ## Live-target reproduction (optional)
 
-If the target has a running deployment, point the agents at it. Hunt now
-**reproduces** each finding against the live service instead of compiling
-a local PoC, Validate **rejects** findings that don't reproduce, and Trace
-**confirms** reachability with real HTTP round-trips. The static path
-remains available — these flags are opt-in.
+If the target has a running deployment, point the agents at it:
 
 ```bash
 audit run --repo /path/to/target --run-id live \
@@ -171,49 +176,13 @@ audit run --repo /path/to/target --run-id live \
   --target-creds password=changechangeme
 ```
 
-Rules the agents follow when `--target-url` is set:
-- Network egress is restricted to that host + `127.0.0.1`. No other external
-  hosts.
-- A finding that doesn't reproduce against the live target is dropped or
-  rejected (depending on stage) — "no fabrication".
-- Credentials flow into every relevant stage's user_input as a dict.
-
 ## Scope notes (optional)
 
-Targets often have intentionally-loose-by-design surfaces that aren't bugs
-(e.g. plaintext API keys when that's a feature, test-only Mailpit endpoints,
-anonymous-analytics ingest). Drop them in a text file and pass it in — the
-notes are appended verbatim to every stage's user_input, and Recon / Hunt /
-Validate honor exclusions you list.
+Pass target-specific scope rules / exclusions:
 
 ```bash
 audit run --repo /path/to/target --scope-notes target_scope.md
 ```
-
-Example `target_scope.md`:
-
-```markdown
-- Mailpit (port 1025) is test-only; ignore.
-- Plaintext API keys in the database are a required feature.
-- Don't flag rate-limit absence on anonymous /ping endpoints.
-- Only consider critical/high severity.
-```
-
-## Recon mines git history
-
-Recon greps the git history for past security patches
-(`CVE`, `sec:`, `fix.*auth`, `sanitize`, …) — patched files are hardened,
-but **sibling files with the same idiom often aren't**. Findings get seeded
-against the unpatched copies. Adds zero cost on repos without that pattern;
-catches real cross-component bugs on repos that have it.
-
-## Logic chains
-
-The pipeline's default is one-attack-class-per-task (the Cloudflare paper's
-narrow-scope rule). Recon can also emit `logic_chain` tasks for high-impact
-multi-component paths (auth-bypass + IDOR + path-traversal that compose into
-RCE, etc.) — one chain per task, with the `scope_hint` naming the specific
-chain. This is the one allowed exception to single-attack-class scoping.
 
 ## Layout
 
@@ -222,9 +191,10 @@ prompts/        8 stage prompts (markdown, loaded as system prompts)
 schemas/        9 JSON schemas — every agent output is validated
 config/         stages.yaml — model + concurrency + tool allowlist per stage
 audit/          Python package
-  auth.py       OAuth check + ANTHROPIC_API_KEY scrubbing
+  auth.py       OpenCode CLI + server reachability check
+  opencode_client.py  HTTP client for the OpenCode Server API (replaces Claude Code SDK)
   state.py      SQLite DAO (runs, tasks, findings, traces, dedupe, costs)
-  runner.py     claude-agent-sdk wrapper with schema validation + repair turn
+  runner.py     OpenCode API wrapper with schema validation + repair turn
   orchestrator.py pipeline driver
   stages/       one module per stage
 work/           per-Hunt-task scratch dirs (sandbox for PoC compile/run)
@@ -251,4 +221,4 @@ which is `.gitignore`d but **not** scrubbed of those reads.
 
 - The pipeline design is from Cloudflare's [Project Glasswing](https://blog.cloudflare.com/cyber-frontier-models/)
   blog post. The credit for the architecture goes there.
-- Built on the official [Claude Code Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview).
+- Built on the [OpenCode Server API](https://opencode.ai/docs/server).
