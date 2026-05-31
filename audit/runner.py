@@ -262,7 +262,7 @@ async def _run_agent_once(
 
             # --- repair loop ---
             attempts = 0
-            errors = _validate(last_text, schema_file)
+            errors = _validate(last_text, schema_file, cwd=cwd)
             if errors:
                 log.info(
                     "[%s/%s] schema validation failed, attempting repair (max %d): %s",
@@ -294,7 +294,7 @@ async def _run_agent_once(
                         f"[{stage}/{artifact_name}] {label} on repair turn: "
                         f"{(last_text or '').strip()[:300]}"
                     )
-                errors = _validate(last_text, schema_file)
+                errors = _validate(last_text, schema_file, cwd=cwd)
 
             if errors:
                 _write_artifact(art, {"kind": "schema_errors", "errors": errors})
@@ -313,7 +313,7 @@ async def _run_agent_once(
                     stage, artifact_name, attempts,
                 )
 
-        payload = extract_json(last_text)
+        payload = extract_json(last_text, cwd=cwd)
         _write_artifact(art, {"kind": "final_payload", "payload": payload})
 
     usage = last_result_msg.get("usage") or {}
@@ -333,9 +333,9 @@ async def _run_agent_once(
     )
 
 
-def _validate(text: str, schema_file: Path) -> list[str]:
+def _validate(text: str, schema_file: Path, *, cwd: Path | None = None) -> list[str]:
     try:
-        payload = extract_json(text)
+        payload = extract_json(text, cwd=cwd)
     except ValueError as e:
         return [f"json_extract: {e}"]
     return validate_schema(payload, schema_file)

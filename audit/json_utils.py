@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from jsonschema import Draft7Validator
 from referencing import Registry, Resource
@@ -14,14 +17,22 @@ from referencing.jsonschema import DRAFT7
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
 
+# The model sometimes writes output to a file and only mentions it in the
+# text response, e.g. "Output written to `recon_output.json`".
+_WROTE_FILE_RE = re.compile(
+    r"(?:output|wrote|written|saved)\s+(?:to|in)\s+[`'\"]?(\S+\.json)[`'\"]?",
+    re.IGNORECASE,
+)
 
-def extract_json(text: str) -> Any:
+
+def extract_json(text: str, *, cwd: Path | None = None) -> Any:
     """Pull a JSON object out of an assistant message.
 
     Order of attempts:
       1. The full text is valid JSON.
-      2. The text contains a ```json ... ``` fenced block.
-      3. The largest balanced {...} or [...] substring is valid JSON.
+      2. The model wrote JSON to a file — read it from *cwd*.
+      3. The text contains a ```json ... ``` fenced block.
+      4. The largest balanced {...} or [...] substring is valid JSON.
 
     Raises ValueError if no JSON can be extracted.
     """
@@ -33,6 +44,18 @@ def extract_json(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+
+    if cwd is not None:
+        m = _WROTE_FILE_RE.search(text)
+        if m:
+            file_path = cwd / m.group(1)
+            if file_path.exists():
+                try:
+                    data = json.loads(file_path.read_text())
+                    log.info("extract_json: read %s (%d bytes)", file_path, file_path.stat().st_size)
+                    return data
+                except (json.JSONDecodeError, OSError) as e:
+                    log.debug("extract_json: failed to read %s: %s", file_path, e)
 
     m = _FENCE_RE.search(text)
     if m:
