@@ -18,6 +18,8 @@ from audit.runner import (
     "429 Too Many Requests",
     "rate limit exceeded, please slow down",
     "rate_limit hit",
+    "You've hit your session limit · resets 5:10am (UTC)",
+    "You've hit your session limit · resets 11pm",
 ])
 def test_quota_classified(text: str) -> None:
     label, exc = _classify_api_error(text)

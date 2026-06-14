@@ -69,6 +69,11 @@ _QUOTA_MARKERS = (
     "out of credits",
     "insufficient_quota",
     "429",
+    # Subscription session/usage caps that reset on a timer, e.g.
+    # "You've hit your session limit · resets 5:10am (UTC)". The reset is
+    # often hours out, so backoff-retrying is futile — treat it as terminal
+    # and let the caller abort into a resumable state.
+    "session limit",
 )
 
 _TRANSIENT_MARKERS = (

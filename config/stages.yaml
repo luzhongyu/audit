@@ -25,6 +25,7 @@ stages:
     model: deepseek-v4-pro
     concurrency: 1
     tools: [read, grep, glob]
+    repair_attempts: 2
   dedupe:
     model: deepseek-v4-pro
     concurrency: 1
@@ -37,6 +38,7 @@ stages:
     model: deepseek-v4-flash
     concurrency: 1
     tools: [read, grep, glob]
+    repair_attempts: 2
   report:
     model: deepseek-v4-flash
     concurrency: 1
