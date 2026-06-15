@@ -52,7 +52,16 @@ class OpenCodeMessage:
 
 
 def _parse_message_response(response: dict) -> OpenCodeMessage:
-    """Turn a /session/:id/message response into an OpenCodeMessage."""
+    """Turn a /session/:id/message response into an OpenCodeMessage.
+
+    OpenCode surfaces provider-level failures (DeepSeek "Insufficient
+    Balance", auth errors, model-not-found, etc.) in ``info.error`` rather
+    than via the ``info.is_error`` flag — which is only set for HTTP-layer
+    errors caught by the client. Detect ``info.error`` here, fold its
+    message into ``text``, and mark ``is_error`` so the runner's
+    error-classification + retry logic engages instead of falling through
+    to a misleading 'empty assistant output' schema failure.
+    """
     info = response.get("info", {})
     parts = response.get("parts", [])
 
@@ -60,6 +69,31 @@ def _parse_message_response(response: dict) -> OpenCodeMessage:
     for p in parts:
         if p.get("type") == "text":
             text_chunks.append(p.get("text", ""))
+
+    # Provider-level error (e.g. DeepSeek 402 Insufficient Balance). Extract
+    # a human-readable message from the nested error object.
+    provider_error = info.get("error")
+    if isinstance(provider_error, dict):
+        err_data = provider_error.get("data") or {}
+        err_msg = (
+            err_data.get("message")
+            or provider_error.get("name")
+            or "provider error"
+        )
+        # Prepend to whatever text exists so the classifier sees the marker.
+        text = f"{err_msg} {(''.join(text_chunks)).strip()}".strip()
+        return OpenCodeMessage(
+            text=text,
+            model=info.get("modelID", "") or "",
+            usage=info.get("tokens") or {},
+            total_cost_usd=info.get("cost"),
+            duration_ms=info.get("duration_ms"),
+            num_turns=info.get("num_turns"),
+            session_id=info.get("session_id"),
+            stop_reason=info.get("finish"),
+            is_error=True,
+            raw=response,
+        )
 
     usage = info.get("tokens") or {}
     model_id = info.get("modelID", "")

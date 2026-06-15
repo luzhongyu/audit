@@ -12,9 +12,45 @@ from audit import stages
 from audit.config import HarnessConfig
 from audit.runner import QuotaExhaustedError
 from audit.state import StateDB
-from audit.stages._common import StageContext
+from audit.stages._common import StageContext, count_source_files
 
 log = logging.getLogger(__name__)
+
+# Dynamic caps for small repos — prevents token waste on tiny codebases
+# (see [[audit-pipeline-token-optimization]] P2/P4).
+# ============  ===========  ================  ===================
+# Source files  max_turns    gapfill_iters     feedback_iters
+# ============  ===========  ================  ===================
+# < 10          5            0                 0
+# 10 – 49       8            1                 0
+# 50+           unchanged    unchanged         unchanged
+# ============  ===========  ================  ===================
+_SMALL_REPO_TURNS: dict[tuple[int | None, int | None], int] = {
+    (None, 10): 5,
+    (10, 50): 8,
+}
+_SMALL_REPO_LOOPS: dict[tuple[int | None, int | None], tuple[int, int]] = {
+    (None, 10): (0, 0),    # (gapfill, feedback)
+    (10, 50): (1, 0),
+}
+
+
+def _apply_repo_size_caps(config: HarnessConfig, file_count: int) -> None:
+    """Dynamically reduce max_turns and loop iterations for small repos."""
+    for (lo, hi), cap in _SMALL_REPO_TURNS.items():
+        if (lo is None or file_count >= lo) and (hi is None or file_count < hi):
+            config.cap_max_turns(cap)
+            log.info("repo size %d files → max_turns capped at %d", file_count, cap)
+            break
+
+    for (lo, hi), (gapfill, feedback) in _SMALL_REPO_LOOPS.items():
+        if (lo is None or file_count >= lo) and (hi is None or file_count < hi):
+            config.cap_loop_iterations(gapfill, feedback)
+            log.info(
+                "repo size %d files → gapfill_iters=%d feedback_iters=%d",
+                file_count, config.gapfill_iterations, config.feedback_iterations,
+            )
+            break
 
 
 class CostExceeded(RuntimeError):
@@ -40,6 +76,11 @@ async def run_pipeline(
         live_target=live_target,
         scope_notes=scope_notes,
     )
+
+    # Count files once; apply dynamic caps for small repos (P2/P4).
+    file_count = count_source_files(ctx.repo_path, config=config.file_count)
+    ctx.file_count = file_count
+    _apply_repo_size_caps(config, file_count)
 
     if db.get_run(run_id) is None:
         db.create_run(str(repo_path.resolve()), run_id)

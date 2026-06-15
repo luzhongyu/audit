@@ -23,9 +23,11 @@ def test_run_and_task_lifecycle(tmp_path: Path) -> None:
     })
     pending = db.get_pending_tasks(rid)
     assert len(pending) == 1
-    assert pending[0].task_id == "t_1"
+    # Task IDs are now run-scoped ("run_id+original_id") to prevent
+    # cross-run PRIMARY KEY collisions.
+    assert pending[0].task_id == "test_run+t_1"
 
-    db.update_task_status("t_1", "done")
+    db.update_task_status("test_run+t_1", "done")
     assert db.get_pending_tasks(rid) == []
     assert any(t.status == "done" for t in db.get_all_tasks(rid))
 
@@ -44,16 +46,21 @@ def test_reset_incomplete_tasks(tmp_path: Path) -> None:
             "target_files": ["a.py"], "rationale": "r", "priority": 1,
             "source": "recon",
         })
-        db.update_task_status(tid, status)
+        # After add_task, the task dict's task_id has been mutated to
+        # the scoped form; use that for status updates.
+        scoped = f"{rid}+{tid}"
+        db.update_task_status(scoped, status)
 
     n = db.reset_incomplete_tasks(rid)
     assert n == 2  # only running + failed are re-queued
     by_status = {t.task_id: t.status for t in db.get_all_tasks(rid)}
     assert by_status == {
-        "t_done": "done", "t_run": "pending",
-        "t_fail": "pending", "t_pend": "pending",
+        f"{rid}+t_done": "done", f"{rid}+t_run": "pending",
+        f"{rid}+t_fail": "pending", f"{rid}+t_pend": "pending",
     }
-    assert {t.task_id for t in db.get_pending_tasks(rid)} == {"t_run", "t_fail", "t_pend"}
+    assert {t.task_id for t in db.get_pending_tasks(rid)} == {
+        f"{rid}+t_run", f"{rid}+t_fail", f"{rid}+t_pend",
+    }
     db.close()
 
 

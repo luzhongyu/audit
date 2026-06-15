@@ -74,6 +74,10 @@ _QUOTA_MARKERS = (
     # often hours out, so backoff-retrying is futile — treat it as terminal
     # and let the caller abort into a resumable state.
     "session limit",
+    # DeepSeek's "Insufficient Balance" (HTTP 402) — account out of prepaid
+    # credit. Retrying won't help until the account is topped up.
+    "insufficient balance",
+    "no enough balance",
 )
 
 _TRANSIENT_MARKERS = (
@@ -95,6 +99,46 @@ _TRANSIENT_MARKERS = (
     "bad gateway",
     "no user message found",    # OpenCode server race condition
 )
+
+
+def _normalize_usage(raw: dict) -> dict:
+    """Normalize provider-specific token-usage keys to a common vocabulary.
+
+    DeepSeek returns ``input``/``output`` with a nested ``cache`` dict
+    (``cache.read``/``cache.write``).  Anthropic-style providers return
+    ``input_tokens``/``output_tokens``/``cache_read_input_tokens``/
+    ``cache_creation_input_tokens``.  This function accepts either shape
+    and always returns the Anthropic-style keys so downstream code
+    (AgentResult, record_cost) can use a single set of accessors.
+    """
+    out: dict = {}
+
+    # input
+    out["input_tokens"] = raw.get("input_tokens") or raw.get("input")
+    # output
+    out["output_tokens"] = raw.get("output_tokens") or raw.get("output")
+    # total
+    out["total_tokens"] = raw.get("total_tokens") or raw.get("total")
+    # reasoning (DeepSeek-specific, kept for observability)
+    if "reasoning" in raw:
+        out["reasoning_tokens"] = raw["reasoning"]
+
+    # cache — may be a nested dict (DeepSeek) or flat keys (Anthropic)
+    cache = raw.get("cache")
+    if isinstance(cache, dict):
+        out["cache_read_tokens"] = (
+            raw.get("cache_read_input_tokens")
+            or cache.get("read")
+        )
+        out["cache_creation_tokens"] = (
+            raw.get("cache_creation_input_tokens")
+            or cache.get("write")
+        )
+    else:
+        out["cache_read_tokens"] = raw.get("cache_read_input_tokens")
+        out["cache_creation_tokens"] = raw.get("cache_creation_input_tokens")
+
+    return out
 
 
 def _classify_api_error(text: str) -> tuple[str, type[RuntimeError]]:
@@ -321,14 +365,14 @@ async def _run_agent_once(
         payload = extract_json(last_text, cwd=cwd)
         _write_artifact(art, {"kind": "final_payload", "payload": payload})
 
-    usage = last_result_msg.get("usage") or {}
+    usage = _normalize_usage(last_result_msg.get("usage") or {})
     return AgentResult(
         payload=payload,
         cost_usd=last_result_msg.get("total_cost_usd"),
         input_tokens=usage.get("input_tokens"),
         output_tokens=usage.get("output_tokens"),
-        cache_read_tokens=usage.get("cache_read_input_tokens"),
-        cache_creation_tokens=usage.get("cache_creation_input_tokens"),
+        cache_read_tokens=usage.get("cache_read_tokens"),
+        cache_creation_tokens=usage.get("cache_creation_tokens"),
         num_turns=last_result_msg.get("num_turns"),
         duration_ms=last_result_msg.get("duration_ms"),
         session_id=last_result_msg.get("session_id"),

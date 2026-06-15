@@ -18,20 +18,20 @@ stages:
     concurrency: 50
     tools: [read, grep, glob, bash]
   validate:
-    model: deepseek-v4-pro        # different from hunt — deliberate disagreement
+    model: deepseek-v4-flash        # was pro — temporarily unified to flash for testing
     concurrency: 10
     tools: [read, grep, glob]     # no Bash: pure analysis
   gapfill:
-    model: deepseek-v4-pro
+    model: deepseek-v4-flash
     concurrency: 1
     tools: [read, grep, glob]
     repair_attempts: 2
   dedupe:
-    model: deepseek-v4-pro
+    model: deepseek-v4-flash
     concurrency: 1
     tools: [read]
   trace:
-    model: deepseek-v4-pro        # most critical stage
+    model: deepseek-v4-flash        # was pro — temporarily unified to flash for testing
     concurrency: 10
     tools: [read, grep, glob, bash]
   feedback:
@@ -48,3 +48,23 @@ stages:
 loops:
   gapfill_iterations: 2     # max Hunt → Validate → Gapfill cycles
   feedback_iterations: 1    # one feedback pass after Trace
+
+# File-counting rules for dynamic sizing (P0/P2/P4).  Only files whose
+# extension appears in `source_extensions` count toward the repo-size
+# estimate.  Common build-config names are always included regardless of
+# extension.  An empty list means "use the built-in defaults".
+sizing:
+  source_extensions: []
+  # Recognised source-code extensions (default when source_extensions is
+  # empty).  Listed here for documentation; edit to override.
+  #   .java .kt .kts .scala .groovy
+  #   .py .pyi .pyx
+  #   .js .jsx .ts .tsx .mjs .cjs
+  #   .go .rs .rb .php .cs .swift
+  #   .c .cpp .cc .cxx .h .hpp .hh .hxx
+  #   .sh .bash .zsh .fish
+  #   .sql .proto .graphql
+  #   .html .htm .css .scss .less .sass .svelte .vue
+  #   .yml .yaml .toml .cfg .ini .conf
+  #   .tf .tfvars .bzl .bazel .cmake
+  #   .md .rst .txt

@@ -20,6 +20,8 @@ from audit.runner import (
     "rate_limit hit",
     "You've hit your session limit · resets 5:10am (UTC)",
     "You've hit your session limit · resets 11pm",
+    "Insufficient Balance",          # DeepSeek 402
+    "insufficient balance — top up your account",
 ])
 def test_quota_classified(text: str) -> None:
     label, exc = _classify_api_error(text)

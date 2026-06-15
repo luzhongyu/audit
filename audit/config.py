@@ -20,10 +20,17 @@ class StageConfig:
 
 
 @dataclass
+class FileCountConfig:
+    """Rules for counting source files (feeds dynamic sizing caps)."""
+    source_extensions: list[str] = field(default_factory=list)
+
+
+@dataclass
 class HarnessConfig:
     stages: dict[str, StageConfig] = field(default_factory=dict)
     gapfill_iterations: int = 2
     feedback_iterations: int = 1
+    file_count: FileCountConfig = field(default_factory=FileCountConfig)
 
     def get(self, stage: str) -> StageConfig:
         try:
@@ -40,6 +47,25 @@ class HarnessConfig:
             raise ValueError("concurrency cap must be >= 1")
         for sc in self.stages.values():
             sc.concurrency = min(sc.concurrency, cap)
+
+    def cap_max_turns(self, cap: int) -> None:
+        """Mutate every stage's max_turns to min(current, cap).
+
+        Called by the orchestrator for small repos where the default
+        25-turn allowance would waste tokens on tool-loop overhead.
+        """
+        if cap < 1:
+            raise ValueError("max_turns cap must be >= 1")
+        for sc in self.stages.values():
+            sc.max_turns = min(sc.max_turns, cap)
+
+    def cap_loop_iterations(self, gapfill: int, feedback: int) -> None:
+        """Reduce the Gapfill and Feedback loop counts.
+
+        Called for small repos where extra hunt iterations are wasteful.
+        """
+        self.gapfill_iterations = min(self.gapfill_iterations, gapfill)
+        self.feedback_iterations = min(self.feedback_iterations, feedback)
 
 
 def load_config(path: Path | None = None) -> HarnessConfig:
@@ -63,8 +89,13 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             ),
         )
     loops = raw.get("loops", {}) or {}
+    sizing = raw.get("sizing", {}) or {}
+    file_count = FileCountConfig(
+        source_extensions=list(sizing.get("source_extensions", [])),
+    )
     return HarnessConfig(
         stages=stages,
         gapfill_iterations=int(loops.get("gapfill_iterations", 2)),
         feedback_iterations=int(loops.get("feedback_iterations", 1)),
+        file_count=file_count,
     )

@@ -20,7 +20,15 @@ A JSON object:
 ```json
 {
   "repo_path": "/abs/path/to/target",
-  "max_tasks": 80,
+  "max_tasks": 5,
+  "source_file_count": 7,
+  "tech_stack": {
+    "build_system": "pom.xml",
+    "build_file_snippet": "<first 80 lines of the build file — or null>",
+    "likely_classes": ["idor", "deserialization_yaml"],
+    "unlikely_classes": ["sql_injection", "nosql_injection", "command_injection", "xxe", "ssrf", "ssti", "ldap_injection", "xpath_injection"],
+    "notes": "build: pom.xml; no signals for: command_injection, ldap_injection, nosql_injection, sql_injection, ssrf, ssti, xpath_injection, xxe; signals found for: deserialization_yaml, idor"
+  },
   "scope_notes": "<optional verbatim text — when present, lists target-specific exclusions or context>",
   "live_target": {
     "url": "http://server.local:8888",
@@ -28,6 +36,29 @@ A JSON object:
   }
 }
 ```
+
+`max_tasks` is **dynamically scaled** to `source_file_count`. Respect it as a
+hard ceiling — the pipeline has already determined the appropriate audit
+breadth for this repo size. `source_file_count` is a rough count of
+tracked source files (via `git ls-files` or a directory walk excluding
+build artifacts, VCS, and dependencies).
+
+**`tech_stack`** is a pre-computed relevance signal:
+- `likely_classes` — attack classes whose dependencies or code patterns
+  were found. Prioritize these.
+- `unlikely_classes` — **zero dependency or code-pattern matches**.
+  Do **not** emit tasks for these classes unless you personally verify a
+  matching sink exists in the source (by reading the build file and
+  relevant source files). The pre-scan is fast, not exhaustive — you
+  have the final say, but need strong evidence to override.
+- `build_file_snippet` — the first 80 lines of the project's build file
+  (pom.xml / package.json / go.mod / …). Read this first to understand
+  the tech stack before deciding on attack classes.
+- Architectural classes (`idor`, `auth_bypass`, `race_condition_toctou`,
+  `logic_chain`, `mass_assignment`, `xss_reflected`, `xss_stored`,
+  `open_redirect`, `information_exposure`, `integer_overflow`,
+  `use_after_free`) are never in `unlikely_classes` — they are always
+  possible and must be evaluated case-by-case.
 
 `scope_notes` and `live_target` are **optional**. If present, treat
 `scope_notes` as authoritative additional rules. If `live_target` is
@@ -80,14 +111,19 @@ prose, no markdown fence, no commentary — just the JSON.
    *pattern* that was fixed, then `grep` the rest of the codebase for the
    same idiom and add a task seeded against the unpatched copies. Do
    not re-test the already-patched file — look for siblings.
-7. **Task queue**. Emit 30–`max_tasks` initial hunt tasks. Each task is
-   **one attack class** against **one subsystem** with concrete
-   `target_files`. Bias toward:
+7. **Task queue**. Emit up to `max_tasks` initial hunt tasks —
+   **do not exceed this ceiling**. For tiny repos (<10 source files),
+   one well-scoped task per genuine trust boundary is enough; do not
+   pad. Each task is **one attack class** against **one subsystem**
+   with concrete `target_files`. Bias toward:
    - Entry points crossing trust boundaries
    - Subsystems that handle untrusted data
    - Attack classes that match the language/framework (e.g. SSTI for
      Jinja, deserialization for pickle, prototype pollution for JS
-     merge functions)
+     merge functions). **Do not emit tasks for attack classes that are
+     impossible given the tech stack** — check the build file and
+     dependencies first; no SQL injection without a database, no XXE
+     without XML parsing, no SSRF without an HTTP client.
    - Lower priority (4–5) for hardened or well-tested areas; higher
      priority (1–2) for sketchy or recently-touched code (use
      `git log --oneline -20 -- <subsystem>` to spot churn).
@@ -121,5 +157,12 @@ prose, no markdown fence, no commentary — just the JSON.
   it verbatim**. Don't emit tasks against components or attack classes
   the operator has explicitly placed out of scope.
 - The output **must** parse against the schema. Re-read it before emitting.
-- Do not produce more than `max_tasks` tasks.
+- Do not produce more than `max_tasks` tasks — this is a **hard ceiling**,
+  not a target. For repos with fewer than 10 source files, 2–3 tasks is
+  often sufficient.
+- **Deduplicate**: never emit two tasks with the same `attack_class` that
+  target the same file(s). If the same vulnerability pattern appears in
+  multiple endpoints within the same file, cover them together in ONE task
+  — list all relevant line ranges in `scope_hint`. Duplicate tasks waste
+  tokens and reduce audit quality by splitting the hunter's focus.
 - Do not emit prose — just JSON.

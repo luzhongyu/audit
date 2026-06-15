@@ -117,6 +117,29 @@ CREATE INDEX IF NOT EXISTS idx_costs_run_stage ON costs(run_id, stage);
 """
 
 
+def _normalize_cost_usage(raw: dict) -> dict:
+    """Normalize provider-specific token keys for cost recording.
+
+    See ``runner._normalize_usage`` for the full mapping; this is a
+    standalone copy so state.py doesn't import from runner.py.
+    """
+    out: dict = {}
+    out["input_tokens"] = raw.get("input_tokens") or raw.get("input")
+    out["output_tokens"] = raw.get("output_tokens") or raw.get("output")
+    cache = raw.get("cache")
+    if isinstance(cache, dict):
+        out["cache_read_tokens"] = (
+            raw.get("cache_read_input_tokens") or cache.get("read")
+        )
+        out["cache_creation_tokens"] = (
+            raw.get("cache_creation_input_tokens") or cache.get("write")
+        )
+    else:
+        out["cache_read_tokens"] = raw.get("cache_read_input_tokens")
+        out["cache_creation_tokens"] = raw.get("cache_creation_input_tokens")
+    return out
+
+
 @dataclass
 class Task:
     task_id: str
@@ -209,14 +232,23 @@ class StateDB:
     # ---------- tasks ----------
 
     def add_task(self, run_id: str, task: dict) -> None:
+        # Scope the task_id to this run so repeated runs against the same
+        # repo (which often produce identical LLM-generated task_ids like
+        # "t_http_api_idor_1") don't collide and get silently dropped by the
+        # PRIMARY KEY constraint.  `++` is used as separator to keep the
+        # string safe for filesystem paths (work_dir, artifact names).
+        original_id = task["task_id"]
+        scoped_id = f"{run_id}+{original_id}"
+        task["task_id"] = scoped_id  # mutate in-place for downstream callers
+
         now = time.time()
         self._conn.execute(
-            """INSERT OR IGNORE INTO tasks
+            """INSERT INTO tasks
             (task_id, run_id, source, attack_class, scope_hint, target_files,
              rationale, priority, status, raw_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
             (
-                task["task_id"],
+                scoped_id,
                 run_id,
                 task.get("source", "recon"),
                 task["attack_class"],
@@ -422,7 +454,9 @@ class StateDB:
         ref_id: str | None,
         result_msg: dict,
     ) -> None:
-        usage = result_msg.get("usage") or {}
+        # Normalize provider-specific token keys (DeepSeek nested cache
+        # vs Anthropic flat keys).  See runner._normalize_usage.
+        usage = _normalize_cost_usage(result_msg.get("usage") or {})
         self._conn.execute(
             """INSERT INTO costs
             (run_id, stage, ref_id, usd, input_tokens, output_tokens,
@@ -435,8 +469,8 @@ class StateDB:
                 result_msg.get("total_cost_usd"),
                 usage.get("input_tokens"),
                 usage.get("output_tokens"),
-                usage.get("cache_read_input_tokens"),
-                usage.get("cache_creation_input_tokens"),
+                usage.get("cache_read_tokens"),
+                usage.get("cache_creation_tokens"),
                 result_msg.get("num_turns"),
                 result_msg.get("duration_ms"),
                 time.time(),

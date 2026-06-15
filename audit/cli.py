@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -24,6 +25,20 @@ DB_PATH = REPO_ROOT / "state.db"
 RESULTS_ROOT = REPO_ROOT / "results"
 
 console = Console()
+
+
+def _default_run_id(repo: Path | str) -> str:
+    """Build a human-readable run_id from the target repo name, e.g.
+    `run_typescript-sdk_a3f1b2c9`. The repo's directory name is sanitized
+    to be path/SQLite-safe; the random suffix keeps repeated runs against
+    the same project unique."""
+    name = Path(repo).resolve().name
+    # Keep only path- and SQLite-safe chars ([A-Za-z0-9._-]); collapse the
+    # rest to a single hyphen so names like "my app!" -> "my-app".
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    if not safe:
+        safe = "repo"
+    return f"run_{safe}_{uuid.uuid4().hex[:8]}"
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -138,7 +153,7 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         scope_notes = Path(scope_notes_path).read_text()
         console.print(f"[cyan]scope notes loaded:[/cyan] {scope_notes_path} ({len(scope_notes)} chars)")
 
-    run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
+    run_id = run_id or _default_run_id(Path(repo))
     repo_path = Path(repo).resolve()
 
     db = StateDB(DB_PATH)
